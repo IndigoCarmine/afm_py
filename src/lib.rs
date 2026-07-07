@@ -315,10 +315,180 @@ fn parse_scan_size_nm(metadata: &HashMap<String, String>) -> f64 {
 }
 
 // --------------------------------------------------------------------------- //
+// Rolling-ball background subtraction (ported from analysis.rs)
+// --------------------------------------------------------------------------- //
+/// Offsets (di, dj) within radius `r` and the ball's height there (sqrt(r^2 - d^2)).
+fn build_ball(r: usize) -> Vec<(i32, i32, f64)> {
+    let ri = r as i32;
+    let r2 = (r * r) as f64;
+    let mut ball = Vec::new();
+    for dj in -ri..=ri {
+        for di in -ri..=ri {
+            let d2 = (di * di + dj * dj) as f64;
+            if d2 <= r2 {
+                ball.push((di, dj, (r2 - d2).sqrt()));
+            }
+        }
+    }
+    ball
+}
+
+/// One morphological pass with the symmetric ball SE: erosion (`dilate=false`)
+/// computes min(g - ball); dilation (`dilate=true`) computes max(g + ball).
+/// Out-of-bounds samples use edge replication.
+fn ball_morph(g: &[f64], w: usize, h: usize, ball: &[(i32, i32, f64)], dilate: bool) -> Vec<f64> {
+    let (wi, hi) = (w as i32, h as i32);
+    let mut out = vec![0.0f64; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = if dilate { f64::NEG_INFINITY } else { f64::INFINITY };
+            for &(di, dj, bh) in ball {
+                let xx = (x as i32 + di).clamp(0, wi - 1) as usize;
+                let yy = (y as i32 + dj).clamp(0, hi - 1) as usize;
+                let s = g[yy * w + xx];
+                if dilate {
+                    acc = acc.max(s + bh);
+                } else {
+                    acc = acc.min(s - bh);
+                }
+            }
+            out[y * w + x] = acc;
+        }
+    }
+    out
+}
+
+/// Grayscale opening (erode then dilate) with a spherical structuring element.
+fn ball_opening(g: &[f64], w: usize, h: usize, r: usize) -> Vec<f64> {
+    let ball = build_ball(r);
+    let eroded = ball_morph(g, w, h, &ball, false);
+    ball_morph(&eroded, w, h, &ball, true)
+}
+
+/// Downsample by taking the minimum of each `k`x`k` block.
+fn shrink_min(data: &[f64], w: usize, h: usize, k: usize) -> (usize, usize, Vec<f64>) {
+    if k <= 1 {
+        return (w, h, data.to_vec());
+    }
+    let sw = w.div_ceil(k);
+    let sh = h.div_ceil(k);
+    let mut out = vec![f64::INFINITY; sw * sh];
+    for y in 0..h {
+        for x in 0..w {
+            let o = (y / k) * sw + (x / k);
+            out[o] = out[o].min(data[y * w + x]);
+        }
+    }
+    (sw, sh, out)
+}
+
+/// Bilinearly enlarge an `sw`x`sh` field to `w`x`h` (corners aligned).
+fn enlarge(small: &[f64], sw: usize, sh: usize, w: usize, h: usize) -> Vec<f64> {
+    if sw == w && sh == h {
+        return small.to_vec();
+    }
+    let mut out = vec![0.0f64; w * h];
+    let sx = if w > 1 { (sw - 1) as f64 / (w - 1) as f64 } else { 0.0 };
+    let sy = if h > 1 { (sh - 1) as f64 / (h - 1) as f64 } else { 0.0 };
+    for y in 0..h {
+        let gy = y as f64 * sy;
+        let y0 = gy.floor() as usize;
+        let y1 = (y0 + 1).min(sh - 1);
+        let ty = gy - y0 as f64;
+        for x in 0..w {
+            let gx = x as f64 * sx;
+            let x0 = gx.floor() as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let tx = gx - x0 as f64;
+            let v00 = small[y0 * sw + x0];
+            let v01 = small[y0 * sw + x1];
+            let v10 = small[y1 * sw + x0];
+            let v11 = small[y1 * sw + x1];
+            let top = v00 + (v01 - v00) * tx;
+            let bot = v10 + (v11 - v10) * tx;
+            out[y * w + x] = top + (bot - top) * ty;
+        }
+    }
+    out
+}
+
+/// Estimate the background of a 0..100 normalized field by rolling a ball of
+/// `radius` px underneath it (grayscale opening), shrinking first for speed.
+fn rolling_ball_background(norm: &[f64], w: usize, h: usize, radius: usize) -> Vec<f64> {
+    let shrink = if radius <= 10 {
+        1
+    } else if radius <= 30 {
+        2
+    } else if radius <= 100 {
+        4
+    } else {
+        8
+    };
+    let small_r = (radius / shrink).max(1);
+    let (sw, sh, small) = shrink_min(norm, w, h, shrink);
+    let small_bg = ball_opening(&small, sw, sh, small_r);
+    enlarge(&small_bg, sw, sh, w, h)
+}
+
+/// Rolling-ball background subtraction (Sternberg). `radius` is in pixels.
+fn rolling_ball_subtract_impl(data: &[f64], w: usize, h: usize, radius: usize) -> Vec<f64> {
+    if radius == 0 || w == 0 || h == 0 || data.len() < w * h {
+        return data.to_vec();
+    }
+    let min = data.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = (max - min).max(f64::EPSILON);
+    const WORK: f64 = 100.0;
+
+    let norm: Vec<f64> = data.iter().map(|&v| (v - min) / range * WORK).collect();
+    let background = rolling_ball_background(&norm, w, h, radius);
+
+    data.iter()
+        .zip(background.iter())
+        .map(|(&v, &bg)| v - (bg / WORK * range + min))
+        .collect()
+}
+
+// --------------------------------------------------------------------------- //
 // Python bindings
 // --------------------------------------------------------------------------- //
 fn err(msg: String) -> PyErr {
     PyValueError::new_err(msg)
+}
+
+/// Rolling-ball background subtraction on a float64 row-major image.
+///
+/// ``data`` is little-endian float64 bytes of length ``w * h * 8``; the result
+/// is returned in the same layout.  Mirrors the desktop viewer's filter.
+#[pyfunction]
+fn rolling_ball_subtract(
+    py: Python<'_>,
+    data: &[u8],
+    w: usize,
+    h: usize,
+    radius: usize,
+) -> PyResult<Py<PyBytes>> {
+    if data.len() % 8 != 0 {
+        return Err(err("data length must be a multiple of 8 (float64)".to_string()));
+    }
+    if data.len() / 8 < w * h {
+        return Err(err(format!(
+            "data has {} values, expected at least {}",
+            data.len() / 8,
+            w * h
+        )));
+    }
+    let values: Vec<f64> = data
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+        .collect();
+    let out = rolling_ball_subtract_impl(&values, w, h, radius);
+
+    let mut raw = Vec::with_capacity(out.len() * 8);
+    for v in &out {
+        raw.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok(PyBytes::new(py, &raw).unbind())
 }
 
 /// Parse an SPM file and return a dict describing one channel.
@@ -417,6 +587,7 @@ fn load_spm(
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_spm, m)?)?;
-    m.add("__doc__", "Native SPM parser for afm_files.")?;
+    m.add_function(wrap_pyfunction!(rolling_ball_subtract, m)?)?;
+    m.add("__doc__", "Native SPM parser and filters for afm_files.")?;
     Ok(())
 }

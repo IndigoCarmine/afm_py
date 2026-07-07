@@ -169,6 +169,56 @@ def test_pipeline_and_specs():
 
 
 # --------------------------------------------------------------------------- #
+# Rolling ball (ports of the Rust analysis.rs tests)
+# --------------------------------------------------------------------------- #
+def test_rolling_ball_noop_for_zero_radius():
+    data = np.array([[1.0, 2.0], [3.0, 4.0]])
+    assert np.array_equal(filters.rolling_ball_subtract(data, radius=0), data)
+
+
+def test_rolling_ball_flattens_constant():
+    const = np.full((32, 32), 5.0)
+    out = filters.rolling_ball_subtract(const, radius=8)
+    assert np.all(np.abs(out) < 1e-3)
+
+
+def test_rolling_ball_keeps_narrow_feature_removes_background():
+    data = np.zeros((40, 40))
+    data[19:21, 19:21] = 10.0  # tiny bump, much smaller than the ball
+    out = filters.rolling_ball_subtract(data, radius=10)
+    assert out[20, 20] > 5.0            # feature preserved
+    assert abs(out[0, 0]) < 1.0         # background removed
+    assert np.all(np.isfinite(out)) and np.all(out >= -1e-3)
+
+
+def test_rolling_ball_backends_agree():
+    from afm_files.parser import HAS_NATIVE
+
+    if not HAS_NATIVE:
+        return
+    rng = np.arange(48 * 48, dtype=np.float64).reshape(48, 48) % 7
+    ys, xs = np.mgrid[0:48, 0:48]
+    data = rng + 0.05 * xs + 0.03 * ys  # texture + gentle background
+    data[24, 24] += 20.0
+
+    native = filters.rolling_ball_subtract(data, radius=12)
+    filters._core, saved = None, filters._core  # force the pure-Python path
+    try:
+        pure = filters.rolling_ball_subtract(data, radius=12)
+    finally:
+        filters._core = saved
+    assert np.allclose(native, pure, atol=1e-6)
+
+
+def test_rolling_ball_background_complement():
+    data = np.zeros((30, 30))
+    data[14:16, 14:16] = 8.0
+    bg = filters.rolling_ball_background(data, radius=9)
+    sub = filters.rolling_ball_subtract(data, radius=9)
+    assert np.allclose(bg + sub, data, atol=1e-9)
+
+
+# --------------------------------------------------------------------------- #
 # Colormaps
 # --------------------------------------------------------------------------- #
 def test_colormaps_shape_and_endpoints():

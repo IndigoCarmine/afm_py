@@ -82,17 +82,27 @@ name so they can be chained in a `Pipeline` or from the CLI.
 ```python
 from afm_files import filters
 
-flat  = filters.flatten_polynomial(img.data, order=2)  # per-line polynomial flatten
-blur  = filters.gaussian_smooth(img.data, sigma=1.5)   # edge-clamped Gaussian
-plane = filters.plane_subtract(img.data)               # remove global tilt plane
+flat  = filters.flatten_polynomial(img.data, order=2)     # per-line polynomial flatten
+blur  = filters.gaussian_smooth(img.data, sigma=1.5)      # edge-clamped Gaussian
+plane = filters.plane_subtract(img.data)                  # remove global tilt plane
+rb    = filters.rolling_ball_subtract(img.data, radius=30)  # Sternberg rolling-ball
 
 # chain by name / spec string
-pipe = filters.Pipeline(["plane", "flatten:1", "smooth:1.0", "offset"])
+pipe = filters.Pipeline(["plane", "flatten:1", "rollball:30", "offset"])
 img.data = pipe(img.data)
 ```
 
-Built-in filters: `flatten:<order>`, `smooth:<sigma>`, `plane`, `offset`
-(zero-min), `zeromean`, `invert`, `clip:<zmin>,<zmax>`.
+Built-in filters: `flatten:<order>`, `smooth:<sigma>`, `plane`,
+`rollball:<radius>`, `offset` (zero-min), `zeromean`, `invert`,
+`clip:<zmin>,<zmax>`.
+
+**Rolling-ball background subtraction** (`rollball` / `rolling_ball_subtract`)
+is the Sternberg algorithm ported from the desktop viewer's Rust core: a ball of
+the given pixel radius is rolled under the surface (grayscale opening on a
+0..100-normalized field, with an ImageJ-style shrink for large radii) and the
+estimated background is subtracted. It runs in the native `_core` when built,
+with an equivalent NumPy fallback otherwise. `filters.rolling_ball_background()`
+returns just the background.
 
 ### File conversion
 

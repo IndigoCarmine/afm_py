@@ -14,10 +14,14 @@ from typing import Callable, Iterable, Union
 
 import numpy as np
 
+from .parser import _core  # native filter core (may be None)
+
 __all__ = [
     "flatten_polynomial",
     "gaussian_smooth",
     "plane_subtract",
+    "rolling_ball_subtract",
+    "rolling_ball_background",
     "subtract_min",
     "subtract_mean",
     "invert",
@@ -102,6 +106,136 @@ def plane_subtract(data: np.ndarray) -> np.ndarray:
     return data - plane
 
 
+# --------------------------------------------------------------------------- #
+# Rolling-ball background subtraction (Sternberg)
+# --------------------------------------------------------------------------- #
+def rolling_ball_subtract(data: np.ndarray, radius: int = 30) -> np.ndarray:
+    """Sternberg rolling-ball background subtraction (``radius`` in pixels).
+
+    A ball of the given radius is rolled underneath the surface (grayscale
+    opening on a 0..100-normalized field, with an ImageJ-style shrink for large
+    radii) and the resulting background is subtracted.  Broad background is
+    removed while features narrower than the ball are preserved.
+
+    Uses the native Rust core (``afm_files._core``) when available and falls
+    back to an equivalent NumPy implementation otherwise.
+    """
+    data = np.asarray(data, dtype=np.float64)
+    if data.ndim != 2:
+        raise ValueError("rolling_ball_subtract expects a 2-D array")
+    radius = int(radius)
+    if radius <= 0:
+        return data.copy()
+
+    h, w = data.shape
+    if _core is not None:
+        buf = np.ascontiguousarray(data, dtype="<f8").tobytes()
+        out = _core.rolling_ball_subtract(buf, w, h, radius)
+        return np.frombuffer(out, dtype="<f8").reshape(h, w).copy()
+    return data - _rolling_ball_background_py(data, radius)
+
+
+def rolling_ball_background(data: np.ndarray, radius: int = 30) -> np.ndarray:
+    """Return just the estimated rolling-ball background (``data`` minus this is
+    :func:`rolling_ball_subtract`)."""
+    data = np.asarray(data, dtype=np.float64)
+    if data.ndim != 2:
+        raise ValueError("rolling_ball_background expects a 2-D array")
+    if int(radius) <= 0:
+        return np.zeros_like(data)
+    return data - rolling_ball_subtract(data, radius)
+
+
+def _rolling_ball_background_py(data: np.ndarray, radius: int) -> np.ndarray:
+    """Pure-NumPy port of the Rust rolling-ball background estimate."""
+    h, w = data.shape
+    dmin = float(data.min())
+    dmax = float(data.max())
+    rng = max(dmax - dmin, float(np.finfo(np.float64).eps))
+    work = 100.0
+    norm = (data - dmin) / rng * work
+
+    if radius <= 10:
+        shrink = 1
+    elif radius <= 30:
+        shrink = 2
+    elif radius <= 100:
+        shrink = 4
+    else:
+        shrink = 8
+    small_r = max(radius // shrink, 1)
+
+    sw, sh, small = _shrink_min(norm, shrink)
+    small_bg = _ball_opening(small, small_r)
+    bg_norm = _enlarge(small_bg, sw, sh, w, h)
+    return bg_norm / work * rng + dmin
+
+
+def _shrink_min(data: np.ndarray, k: int):
+    h, w = data.shape
+    if k <= 1:
+        return w, h, data.copy()
+    sh = -(-h // k)
+    sw = -(-w // k)
+    padded = np.full((sh * k, sw * k), np.inf)
+    padded[:h, :w] = data
+    small = padded.reshape(sh, k, sw, k).min(axis=(1, 3))
+    return sw, sh, small
+
+
+def _build_ball(r: int):
+    r2 = float(r * r)
+    dj, di = np.mgrid[-r : r + 1, -r : r + 1]
+    d2 = (di * di + dj * dj).astype(np.float64)
+    mask = d2 <= r2
+    heights = np.sqrt(np.clip(r2 - d2, 0.0, None))
+    return di[mask].astype(int), dj[mask].astype(int), heights[mask]
+
+
+def _ball_morph(g, di_arr, dj_arr, bh_arr, dilate: bool):
+    h, w = g.shape
+    acc = np.full((h, w), -np.inf if dilate else np.inf)
+    rows = np.arange(h)
+    cols = np.arange(w)
+    for di, dj, bh in zip(di_arr, dj_arr, bh_arr):
+        ys = np.clip(rows + dj, 0, h - 1)
+        xs = np.clip(cols + di, 0, w - 1)
+        shifted = g[np.ix_(ys, xs)]
+        if dilate:
+            np.maximum(acc, shifted + bh, out=acc)
+        else:
+            np.minimum(acc, shifted - bh, out=acc)
+    return acc
+
+
+def _ball_opening(g: np.ndarray, r: int) -> np.ndarray:
+    di, dj, bh = _build_ball(r)
+    eroded = _ball_morph(g, di, dj, bh, dilate=False)
+    return _ball_morph(eroded, di, dj, bh, dilate=True)
+
+
+def _enlarge(small: np.ndarray, sw: int, sh: int, w: int, h: int) -> np.ndarray:
+    if sw == w and sh == h:
+        return small.copy()
+    sx = (sw - 1) / (w - 1) if w > 1 else 0.0
+    sy = (sh - 1) / (h - 1) if h > 1 else 0.0
+    gy = np.arange(h) * sy
+    y0 = np.floor(gy).astype(int)
+    y1 = np.minimum(y0 + 1, sh - 1)
+    ty = (gy - y0)[:, None]
+    gx = np.arange(w) * sx
+    x0 = np.floor(gx).astype(int)
+    x1 = np.minimum(x0 + 1, sw - 1)
+    tx = (gx - x0)[None, :]
+    v00 = small[np.ix_(y0, x0)]
+    v01 = small[np.ix_(y0, x1)]
+    v10 = small[np.ix_(y1, x0)]
+    v11 = small[np.ix_(y1, x1)]
+    top = v00 + (v01 - v00) * tx
+    bot = v10 + (v11 - v10) * tx
+    return top + (bot - top) * ty
+
+
 def subtract_min(data: np.ndarray) -> np.ndarray:
     """Shift the image so its minimum becomes zero."""
     data = np.asarray(data, dtype=np.float64)
@@ -133,6 +267,7 @@ FILTERS: dict = {
     "flatten": (flatten_polynomial, lambda *a: {"order": int(a[0])} if a else {}),
     "smooth": (gaussian_smooth, lambda *a: {"sigma": float(a[0])} if a else {}),
     "plane": (plane_subtract, lambda *a: {}),
+    "rollball": (rolling_ball_subtract, lambda *a: {"radius": int(a[0])} if a and a[0] != "" else {}),
     "offset": (subtract_min, lambda *a: {}),
     "zeromean": (subtract_mean, lambda *a: {}),
     "invert": (invert, lambda *a: {}),

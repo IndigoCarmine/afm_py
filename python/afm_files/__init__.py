@@ -35,6 +35,7 @@ from .filters import (
     flatten_polynomial,
     gaussian_smooth,
     plane_subtract,
+    rolling_ball_subtract,
 )
 from .parser import HAS_NATIVE, ChannelInfo, SpmImage, list_channels, read_spm
 
@@ -53,6 +54,7 @@ __all__ = [
     "flatten_polynomial",
     "gaussian_smooth",
     "plane_subtract",
+    "rolling_ball_subtract",
     "apply_filters",
     "Pipeline",
     # conversion
