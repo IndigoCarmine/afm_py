@@ -1,0 +1,15 @@
+[package]
+name = "afm_files"
+version = "0.1.0"
+edition = "2021"
+description = "Native SPM/AFM file parser for the afm_files Python package"
+license = "MIT"
+
+[lib]
+# Must match the `#[pymodule] fn _core` name; built as a Python extension.
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3-py39 builds against the stable ABI so one wheel works on Python >= 3.9.
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
