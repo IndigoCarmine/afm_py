@@ -90,9 +90,10 @@ def size_folder(img, group_by: str) -> str:
     """Folder name describing the image's XY size."""
     if group_by == "pixels":
         return f"{img.samps_per_line}x{img.number_of_lines}px"
-    # Physical scan size: X = scan width, Y = pixel size * number of lines.
-    x = _fmt_nm(img.scan_size_nm)
-    y = _fmt_nm(img.pixel_size_nm * img.number_of_lines)
+    # Physical scan size along the fast (X) and slow (Y) axes.
+    sx, sy = img.scan_size_xy_nm
+    x = _fmt_nm(sx)
+    y = _fmt_nm(sy)
     return x if x == y else f"{x}x{y}"
 
 

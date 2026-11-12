@@ -298,20 +298,132 @@ fn decode_image(
     Ok(out)
 }
 
-fn parse_scan_size_nm(metadata: &HashMap<String, String>) -> f64 {
-    let raw = match metadata.get("Scan Size") {
-        Some(v) => v,
-        None => return 1000.0,
-    };
-    let value = match raw.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()) {
-        Some(v) => v,
-        None => return 1000.0,
-    };
-    if raw.contains("~m") || raw.contains("um") || raw.contains("µm") {
-        value * 1000.0
+/// Look up a header field, ignoring case in both the section name and the key.
+///
+/// `section` of `None` means the unsectioned key (the first occurrence in file
+/// order); the same call also works on an image block's own field map. When
+/// more than one key matches once case is ignored, the lexicographically first
+/// one wins, so the result does not depend on `HashMap` order.
+fn header_get<'a>(
+    metadata: &'a HashMap<String, String>,
+    section: Option<&str>,
+    key: &str,
+) -> Option<&'a String> {
+    metadata
+        .iter()
+        .filter(|(k, _)| {
+            let (sec, bare) = match k.split_once("::") {
+                Some((s, b)) => (Some(s), b),
+                None => (None, k.as_str()),
+            };
+            bare.eq_ignore_ascii_case(key)
+                && match (section, sec) {
+                    (None, None) => true,
+                    (Some(want), Some(have)) => have.eq_ignore_ascii_case(want),
+                    _ => false,
+                }
+        })
+        .min_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, v)| v)
+}
+
+/// Split a header length field into its numbers, converted to nm: "4000 nm",
+/// "4000", "4 4 ~m" (microns), "5.0 2.5 ~m". The unit applies to every number.
+fn parse_lengths_nm(raw: &str) -> Option<(f64, Option<f64>)> {
+    let scale = if raw.contains("~m") || raw.contains("um") || raw.contains("µm") {
+        1000.0
     } else {
-        value
+        1.0
+    };
+    let mut nums = raw.split_whitespace().filter_map(|s| s.parse::<f64>().ok());
+    let x = nums.next()?;
+    Some((x * scale, nums.next().map(|y| y * scale)))
+}
+
+/// Whether an `Aspect Ratio` field ("1:1", "2:1", ...) describes a rectangular
+/// scan. As in Gwyddion: "1:1" is square, otherwise the leading number decides.
+fn is_nonsquare_aspect(raw: Option<&String>) -> bool {
+    let Some(raw) = raw.map(|v| v.trim()) else {
+        return false;
+    };
+    if raw == "1:1" {
+        return false;
     }
+    match raw
+        .split(':')
+        .next()
+        .and_then(|t| t.trim().parse::<f64>().ok())
+    {
+        Some(v) => v > 0.0 && v != 1.0,
+        None => false,
+    }
+}
+
+/// Lateral scan extents in nm as (x, y): x along the fast (line) axis, y the
+/// extent the image's rows span. Port of `parse_scan_size_nm_xy` in
+/// IndigoCarmine/afm_files, which follows Gwyddion's `nanoscope.c`:
+///
+/// 1. `Scan Size` gives x and, when it spells out a second number, y (a single
+///    number means a square scan).
+/// 2. The scan list's `Slow Axis Size` overrides y when present.
+/// 3. When `Aspect Ratio` is not 1:1, the image's line count is weighed against
+///    the scan list's `Lines` (rectangular or partly captured frames). This is
+///    a no-op for 1:1 scans.
+fn parse_scan_size_nm_xy(
+    metadata: &HashMap<String, String>,
+    image_fields: &HashMap<String, String>,
+    cols: usize,
+    rows: usize,
+) -> (f64, f64) {
+    const DEFAULT: f64 = 1000.0;
+    let candidates: Vec<&String> = ["Ciao scan list", "Ciao image list"]
+        .iter()
+        .filter_map(|s| header_get(metadata, Some(s), "Scan Size"))
+        .chain(header_get(metadata, None, "Scan Size"))
+        .collect();
+    let raw = candidates
+        .iter()
+        .find(|v| parse_lengths_nm(v).is_some_and(|(_, y)| y.is_some()))
+        .or_else(|| candidates.iter().find(|v| parse_lengths_nm(v).is_some()));
+
+    let Some((x, y)) = raw.and_then(|v| parse_lengths_nm(v)) else {
+        return (DEFAULT, DEFAULT);
+    };
+    let mut y = y.unwrap_or(x);
+
+    let have_slow_axis_size = match header_get(metadata, Some("Ciao scan list"), "Slow Axis Size")
+        .and_then(|v| parse_lengths_nm(v))
+    {
+        Some((slow, _)) if slow > 0.0 => {
+            y = slow;
+            true
+        }
+        _ => false,
+    };
+
+    let nonsquare_image = is_nonsquare_aspect(header_get(image_fields, None, "Aspect Ratio"));
+    let nonsquare_scan =
+        is_nonsquare_aspect(header_get(metadata, Some("Ciao scan list"), "Aspect Ratio"));
+    let scan_rows = header_get(metadata, Some("Ciao scan list"), "Lines")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|g| *g > 0);
+
+    if nonsquare_image && rows > 0 {
+        if !have_slow_axis_size {
+            if nonsquare_scan {
+                if cols > 0 {
+                    y = y * rows as f64 / cols as f64;
+                }
+            } else if let Some(g) = scan_rows {
+                y = y * rows as f64 / g as f64;
+            }
+        } else if let Some(g) = scan_rows.filter(|g| rows < *g) {
+            // "Capture Now": fewer lines saved than the scan was set up for.
+            y = y * rows as f64 / g as f64;
+        }
+    }
+
+    (x, y)
 }
 
 // --------------------------------------------------------------------------- //
@@ -495,8 +607,8 @@ fn rolling_ball_subtract(
 ///
 /// Keys: ``data`` (float64 little-endian bytes, row-major, nm), ``rows``,
 /// ``cols``, ``metadata`` (dict), ``channels`` (list of ``(index, name,
-/// direction)``), ``channel_index``, ``channel_name``, ``scan_size_nm``,
-/// ``nm_per_lsb``.
+/// direction)``), ``channel_index``, ``channel_name``, ``scan_size_nm`` (x),
+/// ``scan_size_y_nm``, ``nm_per_lsb``.
 #[pyfunction]
 #[pyo3(signature = (path, channel_index=None, channel_name=None))]
 fn load_spm(
@@ -578,7 +690,10 @@ fn load_spm(
     out.set_item("channels", chan_list)?;
     out.set_item("channel_index", index)?;
     out.set_item("channel_name", chan_name.as_str())?;
-    out.set_item("scan_size_nm", parse_scan_size_nm(&metadata))?;
+    let (scan_x, scan_y) =
+        parse_scan_size_nm_xy(&metadata, block, samps_per_line, number_of_lines);
+    out.set_item("scan_size_nm", scan_x)?;
+    out.set_item("scan_size_y_nm", scan_y)?;
     out.set_item("nm_per_lsb", nm_per_lsb)?;
 
     Ok(out.unbind())

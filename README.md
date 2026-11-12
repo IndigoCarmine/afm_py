@@ -58,8 +58,9 @@ from afm_files import read_spm
 img = read_spm("scan.spm")                 # auto-selects the Height channel
 print(img.summary())
 img.data            # 2-D float64 array in nm, row 0 = top of image
-img.scan_size_nm    # physical scan width (nm)
-img.pixel_size_nm   # nm per pixel
+img.scan_size_nm    # physical scan width (nm, fast axis)
+img.scan_size_xy_nm # (x, y) scan extent (nm); y differs for rectangular scans
+img.pixel_size_nm   # nm per pixel along x (pixel_size_y_nm for y)
 img.metadata        # full header key/value dict
 
 # pick a specific channel by index or name substring
