@@ -107,6 +107,30 @@ def test_backends_agree(tmpdir):
     assert [c.name for c in py.available_channels] == [c.name for c in rs.available_channels]
 
 
+def test_list_channels(tmpdir):
+    spm = Path(tmpdir) / "scan.spm"
+    make_synthetic_spm(spm)
+    channels = afm_files.list_channels(spm)
+    assert len(channels) == 1
+    assert channels[0].name == "Height"
+    assert channels[0].direction == "Retrace"
+
+    # Selecting by name substring works too.
+    img = read_spm(spm, channel="Height")
+    assert img.channel_index == 0
+
+
+def test_missing_marker_raises(tmpdir):
+    bad = Path(tmpdir) / "bad.spm"
+    bad.write_bytes(b"not an spm file")
+    try:
+        read_spm(bad)
+    except ValueError as exc:
+        assert "File list end" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ValueError")
+
+
 def make_scan_size_spm(path: Path, cols: int, rows: int, scan_list, image_list) -> None:
     """Write a 2-byte Height file whose header carries the given extra lines.
 
@@ -219,30 +243,6 @@ def test_scan_size_y_defaults_to_square_pixels():
     )
     assert img.pixel_size_y_nm == img.pixel_size_nm == 100.0
     assert img.extent_nm == (0.0, 400.0, 0.0, 200.0)
-
-
-def test_list_channels(tmpdir):
-    spm = Path(tmpdir) / "scan.spm"
-    make_synthetic_spm(spm)
-    channels = afm_files.list_channels(spm)
-    assert len(channels) == 1
-    assert channels[0].name == "Height"
-    assert channels[0].direction == "Retrace"
-
-    # Selecting by name substring works too.
-    img = read_spm(spm, channel="Height")
-    assert img.channel_index == 0
-
-
-def test_missing_marker_raises(tmpdir):
-    bad = Path(tmpdir) / "bad.spm"
-    bad.write_bytes(b"not an spm file")
-    try:
-        read_spm(bad)
-    except ValueError as exc:
-        assert "File list end" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("expected ValueError")
 
 
 # --------------------------------------------------------------------------- #
