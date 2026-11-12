@@ -31,12 +31,17 @@ def _expected_nm_per_lsb() -> float:
     return effective * NM_PER_V
 
 
-def make_synthetic_spm(path: Path) -> np.ndarray:
-    """Write a minimal valid SPM file; return the raw (bottom-to-top) int grid."""
+def make_synthetic_spm(path: Path, start_context=None) -> np.ndarray:
+    """Write a minimal valid SPM file; return the raw (bottom-to-top) int grid.
+
+    ``start_context`` adds a ``\\Start context`` line to the image block.  The
+    pixel data is always written little-endian, as the instrument does.
+    """
     # Raw values as stored in the file (line order = bottom-to-top).
     raw = np.arange(SAMPS * LINES, dtype=np.int16).reshape(LINES, SAMPS) * 3
     data_bytes = raw.astype("<i2").tobytes()
 
+    context = [r"\Start context: %s" % start_context] if start_context else []
     header = "\n".join(
         [
             r"\*File list",
@@ -50,6 +55,7 @@ def make_synthetic_spm(path: Path) -> np.ndarray:
             r"\Samps/line: %d" % SAMPS,
             r"\Number of lines: %d" % LINES,
             r"\Bytes/pixel: 2",
+            *context,
             r"\Line Direction: Retrace",
             r'\@2:Image Data: S [Height] "Height"',
             r"\@2:Z scale: V [Sens. Zsens] (%s V/LSB) %s V" % (V_PER_LSB, Z_SCALE_V),
@@ -105,6 +111,24 @@ def test_backends_agree(tmpdir):
     assert py.channel_name == rs.channel_name
     assert py.metadata.get("Scan Size") == rs.metadata.get("Scan Size")
     assert [c.name for c in py.available_channels] == [c.name for c in rs.available_channels]
+
+
+def test_start_context_big_is_still_little_endian(tmpdir):
+    """``Start context: OL1BIG``/``OL2BIG`` does not mean big-endian data.
+
+    Instruments write these values on files whose pixels are little-endian;
+    decoding them as big-endian returned noise without an error.
+    """
+    from afm_files.parser import HAS_NATIVE
+
+    backends = ["python"] + (["rust"] if HAS_NATIVE else [])
+    for context in ("OL1BIG", "OL2BIG"):
+        spm = Path(tmpdir) / f"{context}.spm"
+        raw = make_synthetic_spm(spm, start_context=context)
+        expected = raw[::-1, :].astype(np.float64) * _expected_nm_per_lsb()
+        for backend in backends:
+            img = read_spm(spm, backend=backend)
+            assert np.allclose(img.data, expected), (context, backend)
 
 
 def test_list_channels(tmpdir):

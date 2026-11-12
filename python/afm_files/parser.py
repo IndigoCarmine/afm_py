@@ -333,8 +333,8 @@ def _choose_block(blocks: list, channel: Union[int, str, None]):
     raise ValueError("No image block with required fields found")
 
 
-def _decode_image(data_bytes, samps_per_line, number_of_lines, bytes_per_pixel,
-                  start_context: Optional[str]) -> np.ndarray:
+def _decode_image(data_bytes, samps_per_line, number_of_lines,
+                  bytes_per_pixel) -> np.ndarray:
     n_pixels = samps_per_line * number_of_lines
     expected = n_pixels * bytes_per_pixel
     if len(data_bytes) < expected:
@@ -342,15 +342,16 @@ def _decode_image(data_bytes, samps_per_line, number_of_lines, bytes_per_pixel,
             f"Not enough image bytes: expected {expected}, got {len(data_bytes)}"
         )
 
-    big_endian = bool(start_context) and "BIG" in start_context.upper()
+    # Nanoscope image data is little-endian.  The header's ``Start context``
+    # (e.g. ``OL1BIG``/``OL2BIG``) is not a byte-order flag: files carrying it
+    # are little-endian too, and Gwyddion's reader ignores it for this purpose.
     if bytes_per_pixel == 2:
-        base = np.int16
+        dtype = np.dtype("<i2")
     elif bytes_per_pixel == 4:
-        base = np.int32
+        dtype = np.dtype("<i4")
     else:
         raise ValueError(f"Unsupported Bytes/pixel value: {bytes_per_pixel}")
 
-    dtype = np.dtype(base).newbyteorder(">" if big_endian else "<")
     flat = np.frombuffer(data_bytes[:expected], dtype=dtype).astype(np.float64)
     image = flat.reshape(number_of_lines, samps_per_line)
     # Nanoscope stores lines bottom-to-top; flip so row 0 is the image top.
@@ -420,7 +421,6 @@ def _read_spm_python(path: Path, channel: Union[int, str, None]) -> SpmImage:
         samps_per_line,
         number_of_lines,
         bytes_per_pixel,
-        block.get("Start context"),
     )
 
     nm_per_lsb = _parse_nm_per_lsb(block, metadata, bytes_per_pixel)

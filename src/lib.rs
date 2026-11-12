@@ -245,7 +245,6 @@ fn decode_image(
     samps_per_line: usize,
     number_of_lines: usize,
     bytes_per_pixel: usize,
-    start_context: Option<&String>,
 ) -> Result<Vec<f64>, String> {
     let n_pixels = samps_per_line
         .checked_mul(number_of_lines)
@@ -260,30 +259,19 @@ fn decode_image(
         ));
     }
 
-    let big_endian = start_context
-        .map(|v| v.to_ascii_uppercase().contains("BIG"))
-        .unwrap_or(false);
-
+    // Nanoscope image data is little-endian. The header's `Start context`
+    // (e.g. `OL1BIG`/`OL2BIG`) is not a byte-order flag: files carrying it are
+    // little-endian too, and Gwyddion's reader ignores it for this purpose.
     let mut flat = Vec::with_capacity(n_pixels);
     match bytes_per_pixel {
         2 => {
             for chunk in data_bytes[..expected].chunks_exact(2) {
-                let v = if big_endian {
-                    i16::from_be_bytes([chunk[0], chunk[1]])
-                } else {
-                    i16::from_le_bytes([chunk[0], chunk[1]])
-                };
-                flat.push(v as f64);
+                flat.push(i16::from_le_bytes([chunk[0], chunk[1]]) as f64);
             }
         }
         4 => {
             for chunk in data_bytes[..expected].chunks_exact(4) {
-                let v = if big_endian {
-                    i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                } else {
-                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                };
-                flat.push(v as f64);
+                flat.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64);
             }
         }
         other => return Err(format!("Unsupported Bytes/pixel value: {other}")),
@@ -545,7 +533,6 @@ fn load_spm(
         samps_per_line,
         number_of_lines,
         bytes_per_pixel,
-        block.get("Start context"),
     )
     .map_err(err)?;
 
