@@ -131,6 +131,120 @@ def test_missing_marker_raises(tmpdir):
         raise AssertionError("expected ValueError")
 
 
+def make_scan_size_spm(path: Path, cols: int, rows: int, scan_list, image_list) -> None:
+    """Write a 2-byte Height file whose header carries the given extra lines.
+
+    ``scan_list`` / ``image_list`` are header lines (without the leading
+    backslash) for the ``Ciao scan list`` and the image block.
+    """
+    raw = np.arange(cols * rows, dtype=np.int16).reshape(rows, cols)
+    data_bytes = raw.astype("<i2").tobytes()
+    header = "\n".join(
+        [
+            r"\*File list",
+            r"\Version: 0x09300201",
+            r"\*Ciao scan list",
+            *("\\" + line for line in scan_list),
+            r"\@Sens. Zsens: V 45.0 nm/V",
+            r"\*Ciao image list",
+            r"\Data offset: %d" % DATA_OFFSET,
+            r"\Data length: %d" % len(data_bytes),
+            r"\Samps/line: %d" % cols,
+            r"\Number of lines: %d" % rows,
+            r"\Bytes/pixel: 2",
+            *("\\" + line for line in image_list),
+            r'\@2:Image Data: S [Height] "Height"',
+            r"\@2:Z scale: V [Sens. Zsens] (%s V/LSB) %s V" % (V_PER_LSB, Z_SCALE_V),
+            r"\*File list end",
+            "",
+        ]
+    ).encode("ascii")
+    path.write_bytes(header + b"\x00" * (DATA_OFFSET - len(header)) + data_bytes)
+
+
+def _read_all_backends(path: Path) -> list:
+    from afm_files.parser import HAS_NATIVE
+
+    return [read_spm(path, backend=b) for b in ["python"] + (["rust"] if HAS_NATIVE else [])]
+
+
+# (scan list lines, image block lines, cols, rows, expected (x, y) in nm)
+SCAN_SIZE_CASES = {
+    # Square scan saved with fewer lines than samples: pixels are not square,
+    # the rows still span the full 1 um.
+    "square_scan_rectangular_pixels": (
+        ["Scan Size: 1000 nm", "Slow Axis Size: 1000 nm", "Lines: 4", "Aspect Ratio: 1:1"],
+        ["Scan Size: 1 1 ~m", "Aspect Ratio: 1:1"],
+        8, 4, (1000.0, 1000.0),
+    ),
+    # Second number of the pair names y.
+    "pair_gives_y": (
+        ["Scan Size: 1000 nm", "Aspect Ratio: 1:1"],
+        ["Scan Size: 1 0.25 ~m", "Aspect Ratio: 1:1"],
+        8, 8, (1000.0, 250.0),
+    ),
+    # Slow Axis Size overrides the pair.
+    "slow_axis_size": (
+        ["Scan Size: 1000 nm", "Slow Axis Size: 400 nm", "Aspect Ratio: 1:1"],
+        ["Scan Size: 1 1 ~m", "Aspect Ratio: 1:1"],
+        8, 8, (1000.0, 400.0),
+    ),
+    # "Capture Now" on a 2:1 scan set up for 8 lines, saved after 4.
+    "partly_captured": (
+        ["Scan Size: 1000 nm", "Slow Axis Size: 500 nm", "Lines: 8", "Aspect Ratio: 2:1"],
+        ["Scan Size: 1 0.5 ~m", "Aspect Ratio: 2:1"],
+        8, 4, (1000.0, 250.0),
+    ),
+    # Some writers spell the key "Scan size".
+    "lowercase_key": (
+        ["Scan size: 4000 nm"],
+        [],
+        4, 4, (4000.0, 4000.0),
+    ),
+}
+
+
+def test_scan_size_x_and_y(tmpdir):
+    for name, (scan_list, image_list, cols, rows, (ex, ey)) in SCAN_SIZE_CASES.items():
+        spm = Path(tmpdir) / f"{name}.spm"
+        make_scan_size_spm(spm, cols, rows, scan_list, image_list)
+        for img in _read_all_backends(spm):
+            assert np.isclose(img.scan_size_nm, ex), name
+            assert np.isclose(img.scan_size_y_nm, ey), name
+            assert np.allclose(img.scan_size_xy_nm, (ex, ey)), name
+            assert np.isclose(img.pixel_size_nm, ex / cols), name
+            assert np.isclose(img.pixel_size_y_nm, ey / rows), name
+            assert np.allclose(img.extent_nm, (0.0, ex, 0.0, ey)), name
+
+
+def test_xyz_uses_pixel_size_per_axis(tmpdir):
+    spm = Path(tmpdir) / "rect.spm"
+    scan_list, image_list, cols, rows, (ex, ey) = SCAN_SIZE_CASES[
+        "square_scan_rectangular_pixels"
+    ]
+    make_scan_size_spm(spm, cols, rows, scan_list, image_list)
+    xyz = np.loadtxt(convert(spm, Path(tmpdir) / "rect.xyz"))
+    assert np.isclose(xyz[:, 0].max(), ex / cols * (cols - 1))
+    assert np.isclose(xyz[:, 1].max(), ey / rows * (rows - 1))
+
+
+def test_scan_size_y_defaults_to_square_pixels():
+    """An SpmImage built without ``scan_size_y_nm`` keeps the old behaviour."""
+    img = afm_files.SpmImage(
+        data=np.zeros((2, 4)),
+        metadata={},
+        scan_size_nm=400.0,
+        samps_per_line=4,
+        number_of_lines=2,
+        channel_name="Height",
+        channel_index=0,
+        available_channels=[],
+        nm_per_lsb=1.0,
+    )
+    assert img.pixel_size_y_nm == img.pixel_size_nm == 100.0
+    assert img.extent_nm == (0.0, 400.0, 0.0, 200.0)
+
+
 # --------------------------------------------------------------------------- #
 # Filters
 # --------------------------------------------------------------------------- #

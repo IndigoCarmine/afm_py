@@ -87,11 +87,11 @@ def write_xyz(obj, path, fmt: str = "%.6g") -> Path:
     data = _as_data(obj)
     h, w = data.shape
     if isinstance(obj, SpmImage):
-        px = obj.pixel_size_nm
+        px, py = obj.pixel_size_nm, obj.pixel_size_y_nm
     else:
-        px = 1.0
+        px = py = 1.0
     ys, xs = np.mgrid[0:h, 0:w]
-    cols = np.column_stack([xs.ravel() * px, ys.ravel() * px, data.ravel()])
+    cols = np.column_stack([xs.ravel() * px, ys.ravel() * py, data.ravel()])
     # Headerless 3-column "x y z" (nm), the usual interchange form for AFM data.
     np.savetxt(path, cols, fmt=fmt)
     return path
@@ -128,9 +128,11 @@ def write_metadata(obj, path) -> Path:
             "channel_name": obj.channel_name,
             "channel_index": obj.channel_index,
             "scan_size_nm": obj.scan_size_nm,
+            "scan_size_y_nm": obj.scan_size_xy_nm[1],
             "samps_per_line": obj.samps_per_line,
             "number_of_lines": obj.number_of_lines,
             "pixel_size_nm": obj.pixel_size_nm,
+            "pixel_size_y_nm": obj.pixel_size_y_nm,
             "nm_per_lsb": obj.nm_per_lsb,
             "available_channels": [
                 {"index": c.index, "name": c.name, "direction": c.direction}

@@ -62,7 +62,7 @@ class SpmImage:
         Flattened header key/value dictionary.  Keys are stored both plainly
         (first occurrence wins) and namespaced as ``"<section>::<key>"``.
     scan_size_nm:
-        Physical width of the scan in nanometers.
+        Physical width of the scan in nanometers (fast axis, the columns).
     channel_name / channel_index:
         Which channel was decoded.
     available_channels:
@@ -71,6 +71,9 @@ class SpmImage:
         The LSB -> nm scale factor that was applied.
     source_path:
         Path the image was read from, if any.
+    scan_size_y_nm:
+        Physical height of the scan in nanometers (slow axis, the rows).
+        ``None`` means unknown, in which case square pixels are assumed.
     """
 
     data: np.ndarray
@@ -83,6 +86,7 @@ class SpmImage:
     available_channels: list
     nm_per_lsb: float
     source_path: Optional[Path] = None
+    scan_size_y_nm: Optional[float] = None
 
     # -- convenience ------------------------------------------------------- #
     @property
@@ -91,20 +95,37 @@ class SpmImage:
 
     @property
     def pixel_size_nm(self) -> float:
-        """Size of one pixel in nm (assumes square pixels)."""
+        """Size of one pixel along x (the fast axis) in nm."""
         return self.scan_size_nm / self.samps_per_line if self.samps_per_line else 0.0
+
+    @property
+    def pixel_size_y_nm(self) -> float:
+        """Size of one pixel along y (the slow axis) in nm.
+
+        Equals :attr:`pixel_size_nm` for square pixels.
+        """
+        if self.scan_size_y_nm is None:
+            return self.pixel_size_nm
+        return self.scan_size_y_nm / self.number_of_lines if self.number_of_lines else 0.0
+
+    @property
+    def scan_size_xy_nm(self) -> tuple:
+        """``(x, y)`` physical scan extent in nm."""
+        return (self.scan_size_nm, self.pixel_size_y_nm * self.number_of_lines)
 
     @property
     def extent_nm(self) -> tuple:
         """``(x0, x1, y0, y1)`` extent in nm, suitable for ``imshow``."""
-        px = self.pixel_size_nm
-        return (0.0, self.scan_size_nm, 0.0, px * self.number_of_lines)
+        x, y = self.scan_size_xy_nm
+        return (0.0, x, 0.0, y)
 
     def summary(self) -> str:
+        x, y = self.scan_size_xy_nm
+        size = f"{x:g} nm" if x == y else f"{x:g}x{y:g} nm"
         return (
             f"SpmImage(channel={self.channel_name!r}, "
             f"shape={self.number_of_lines}x{self.samps_per_line}, "
-            f"scan_size={self.scan_size_nm:g} nm, "
+            f"scan_size={size}, "
             f"z=[{float(self.data.min()):.3g}, {float(self.data.max()):.3g}] nm)"
         )
 
@@ -357,20 +378,114 @@ def _decode_image(data_bytes, samps_per_line, number_of_lines, bytes_per_pixel,
     return image[::-1, :].copy()
 
 
-def _parse_scan_size_nm(metadata: dict) -> float:
-    raw = metadata.get("Scan Size")
+def _header_get(metadata: dict, section: Optional[str], key: str) -> Optional[str]:
+    """Look up a header field, ignoring case in both the section and the key.
+
+    ``section=None`` means the unsectioned key (the first occurrence in file
+    order); the same call works on an image block's own field dict.  When more
+    than one key matches once case is ignored, the lexicographically first one
+    wins, as in the Rust parser.
+    """
+    key_l = key.lower()
+    want = section.lower() if section is not None else None
+    hits = []
+    for k, v in metadata.items():
+        sec, sep, bare = k.partition("::")
+        if not sep:
+            sec, bare = None, k
+        if bare.lower() != key_l:
+            continue
+        if (want is None and sec is None) or (
+            want is not None and sec is not None and sec.lower() == want
+        ):
+            hits.append((k, v))
+    return min(hits)[1] if hits else None
+
+
+def _parse_lengths_nm(raw: str):
+    """``"4000 nm"`` -> ``(4000, None)``; ``"5 2.5 ~m"`` -> ``(5000, 2500)``."""
+    scale = 1000.0 if ("~m" in raw or "um" in raw or "µm" in raw) else 1.0
+    nums = []
+    for tok in raw.split():
+        try:
+            nums.append(float(tok))
+        except ValueError:
+            continue
+    if not nums:
+        return None
+    return nums[0] * scale, (nums[1] * scale if len(nums) > 1 else None)
+
+
+def _is_nonsquare_aspect(raw: Optional[str]) -> bool:
+    """Whether an ``Aspect Ratio`` (``"1:1"``, ``"2:1"``...) is rectangular."""
     if raw is None:
-        return 1000.0
-    tokens = raw.split()
-    if not tokens:
-        return 1000.0
+        return False
+    raw = raw.strip()
+    if raw == "1:1":
+        return False
     try:
-        value = float(tokens[0])
+        v = float(raw.split(":")[0].strip())
     except ValueError:
-        return 1000.0
-    if ("~m" in raw) or ("um" in raw) or ("µm" in raw):
-        return value * 1000.0
-    return value
+        return False
+    return v > 0 and v != 1.0
+
+
+def _parse_scan_size_nm_xy(metadata: dict, block: dict, cols: int, rows: int):
+    """Lateral extents ``(x, y)`` in nm: x along the fast axis, y the rows.
+
+    Port of ``parse_scan_size_nm_xy`` in the upstream Rust viewer, which
+    follows Gwyddion's ``nanoscope.c``:
+
+    1. ``Scan Size`` gives x and, when it spells out a second number, y
+       (a single number means a square scan).
+    2. The scan list's ``Slow Axis Size`` overrides y when present.
+    3. When ``Aspect Ratio`` is not 1:1, the image's line count is weighed
+       against the scan list's ``Lines`` (rectangular or partly captured
+       frames).  This step is a no-op for 1:1 scans.
+    """
+    default = 1000.0
+    candidates = [
+        v
+        for v in (
+            _header_get(metadata, "Ciao scan list", "Scan Size"),
+            _header_get(metadata, "Ciao image list", "Scan Size"),
+            _header_get(metadata, None, "Scan Size"),
+        )
+        if v is not None
+    ]
+    parsed = [p for p in (_parse_lengths_nm(c) for c in candidates) if p is not None]
+    pick = next((p for p in parsed if p[1] is not None), parsed[0] if parsed else None)
+    if pick is None:
+        return default, default
+    x, y = pick[0], (pick[1] if pick[1] is not None else pick[0])
+
+    have_slow_axis_size = False
+    slow_raw = _header_get(metadata, "Ciao scan list", "Slow Axis Size")
+    slow = _parse_lengths_nm(slow_raw) if slow_raw is not None else None
+    if slow is not None and slow[0] > 0:
+        y = slow[0]
+        have_slow_axis_size = True
+
+    nonsquare_image = _is_nonsquare_aspect(_header_get(block, None, "Aspect Ratio"))
+    nonsquare_scan = _is_nonsquare_aspect(
+        _header_get(metadata, "Ciao scan list", "Aspect Ratio")
+    )
+    try:
+        scan_rows = int((_header_get(metadata, "Ciao scan list", "Lines") or "").strip())
+    except ValueError:
+        scan_rows = 0
+
+    if nonsquare_image and rows > 0:
+        if not have_slow_axis_size:
+            if nonsquare_scan:
+                if cols > 0:
+                    y = y * rows / cols
+            elif scan_rows > 0:
+                y = y * rows / scan_rows
+        elif 0 < scan_rows and rows < scan_rows:
+            # "Capture Now": fewer lines saved than the scan was set up for.
+            y = y * rows / scan_rows
+    return x, y
 
 
 # --------------------------------------------------------------------------- #
@@ -425,11 +540,15 @@ def _read_spm_python(path: Path, channel: Union[int, str, None]) -> SpmImage:
 
     nm_per_lsb = _parse_nm_per_lsb(block, metadata, bytes_per_pixel)
     image *= nm_per_lsb
+    scan_x, scan_y = _parse_scan_size_nm_xy(
+        metadata, block, samps_per_line, number_of_lines
+    )
 
     return SpmImage(
         data=image,
         metadata=metadata,
-        scan_size_nm=_parse_scan_size_nm(metadata),
+        scan_size_nm=scan_x,
+        scan_size_y_nm=scan_y,
         samps_per_line=samps_per_line,
         number_of_lines=number_of_lines,
         channel_name=channel_name,
@@ -455,6 +574,7 @@ def _read_spm_rust(path: Path, channel: Union[int, str, None]) -> SpmImage:
         data=image,
         metadata=dict(res["metadata"]),
         scan_size_nm=res["scan_size_nm"],
+        scan_size_y_nm=res["scan_size_y_nm"],
         samps_per_line=cols,
         number_of_lines=rows,
         channel_name=res["channel_name"],
